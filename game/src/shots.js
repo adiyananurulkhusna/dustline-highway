@@ -1,79 +1,143 @@
-// The screenshot scenes behind ?shot=start|play|end. Each one plays the real rules forward from a
-// fresh world for a fixed number of steps, steered by a simple autopilot (look ahead each way the
-// paddle could move, keep clear of blocks, chase the lowest coin when that is safe), so the frame
-// is what a short game really looks like and the same seed always gives the same frame.
-import { FIELD, PLAYER, STEP } from './config.js';
-import { EVENT_OVER, KIND_BLOCK } from './world.js';
-import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+// Dustline Highway — shots.js
+// The screenshot scenes behind ?shot=cover|highway|town|mission (with &seed=N).
+// Each one stages a real, playable moment of the game — a police chase through
+// town, a highway drive, a walk through town, a turf-war mission — then lets
+// the normal loop run it, so the frame is a true render of the game's own code.
+// The same seed always gives the same frame.
+import { spawnTraffic } from './traffic.js';
+import { startMission } from './missions.js';
+import { addHeat } from './player.js';
+import { spawnCruiser } from './police.js';
 
-const START_SECONDS = 5;
-const PLAY_SECONDS = 26;
-const END_LIMIT_SECONDS = 600;
-/**
- * How far ahead, in seconds, the autopilot checks each way it could move: the play scene's pilot
- * looks well ahead and keeps all its lives; the end scene's looks only a moment ahead, so it is
- * caught out once the blocks speed up, as a hurried player is.
- */
-const HORIZON_PLAY = 0.7;
-const HORIZON_END = 0.25;
-const SAMPLE = 1 / 30;
-const DIRECTIONS = [0, -1, 1];
-/** Extra room, each side, it keeps between the paddle and a block. */
-const MARGIN = 10;
-
-/** Seconds until moving in `direction` (-1, 0, 1) runs the paddle into a block; Infinity when it never does. */
-function timeToHit(state, direction, horizon) {
-  const player = state.player;
-  for (let t = SAMPLE; t <= horizon; t += SAMPLE) {
-    const x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * t));
-    for (let index = 0; index < state.items.length; index += 1) {
-      const item = state.items[index];
-      if (!item.active || item.kind !== KIND_BLOCK) continue;
-      const y = item.y + item.speed * t;
-      if (y + item.height > player.y && y < player.y + player.height && item.x < x + player.width + MARGIN && item.x + item.width > x - MARGIN) return t;
-    }
-  }
-  return Infinity;
+function nodeIndex(world, x, y) {
+  return world.nodes.findIndex((n) => n.x === x && n.y === y);
 }
 
-/** Of the safe ways to move, the one toward the lowest coin (or the centre); else the one that is hit last. */
-function autopilot(state, horizon) {
-  const player = state.player;
-  let coin = null;
-  for (let index = 0; index < state.items.length; index += 1) {
-    const item = state.items[index];
-    if (item.active && item.kind !== KIND_BLOCK && (coin === null || item.y > coin.y)) coin = item;
-  }
-  const target = coin === null ? FIELD.width / 2 : coin.x + coin.width / 2;
-  const centre = player.x + player.width / 2;
-  const wanted = target > centre + 8 ? 1 : target < centre - 8 ? -1 : 0;
-  let best = wanted;
-  let bestTime = timeToHit(state, wanted, horizon);
-  for (let index = 0; index < DIRECTIONS.length && bestTime !== Infinity; index += 1) {
-    const time = timeToHit(state, DIRECTIONS[index], horizon);
-    if (time > bestTime) {
-      bestTime = time;
-      best = DIRECTIONS[index];
-    }
-  }
-  return best;
+function placePlayerCar(game, x, y, angle) {
+  const car = game.cars.find((c) => c.parked);
+  if (!car) return null;
+  car.parked = false;
+  car.x = x;
+  car.y = y;
+  car.angle = angle;
+  car.speed = 420;
+  car.color = '#e5382a'; // Cole's signature red coupe, easy to spot.
+  game.player.inCar = car;
+  car.driver = game.player;
+  game.player.x = x;
+  game.player.y = y;
+  return car;
 }
 
-/**
- * Set `world` to the named scene (start, play or end; any other name is start) and return the
- * screen to draw over it and the best score to show.
- */
-export function stageShot(name, world) {
-  world.reset();
-  if (name !== 'play' && name !== 'end') {
-    for (let index = 0; index < START_SECONDS / STEP; index += 1) world.step(STEP, 0, true);
-    return { screen: SCREEN_TITLE, best: 0 };
+function chaseSetup(game, wanted, cruiserCount) {
+  addHeat(game.player, wanted);
+  game.player.wanted = wanted;
+  game.police.cruisers = [];
+  for (let i = 0; i < cruiserCount; i++) {
+    const c = spawnCruiser(game.world, game.rng, game.player);
+    c.x = game.player.x - 200 - i * 120;
+    c.y = game.player.y; // on the same street, so they chase down the road
+    c.angle = game.player.angle;
+    c.speed = 430;
+    game.police.cruisers.push(c);
   }
-  const limit = name === 'end' ? END_LIMIT_SECONDS : PLAY_SECONDS;
-  const horizon = name === 'end' ? HORIZON_END : HORIZON_PLAY;
-  for (let index = 0; index < limit / STEP; index += 1) {
-    if (world.step(STEP, autopilot(world.state, horizon), false) & EVENT_OVER) break;
+}
+
+// Line traffic up along one road, in lanes, spaced out — never a pile-up.
+function lineUpTraffic(game, roadY, x0, x1, count, eastFirst) {
+  const fresh = spawnTraffic(game.world, game.rng, count);
+  const laneA = roadY - 38;
+  const laneB = roadY + 38;
+  fresh.forEach((c, i) => {
+    const east = (i % 2 === 0) === eastFirst;
+    c.parked = false;
+    c.x = x0 + ((x1 - x0) * (i + 1)) / (count + 1);
+    c.y = east ? laneA : laneB;
+    c.angle = east ? 0 : Math.PI;
+    c.speed = c.cruise;
+    c.node = nodeIndex(game.world, east ? 700 : 2450, roadY === 1950 ? 1950 : roadY);
+    c.targetNode = nodeIndex(game.world, east ? 2450 : 700, roadY === 1950 ? 1950 : roadY);
+    if (c.node < 0 || c.targetNode < 0) {
+      c.node = 0;
+      c.targetNode = 1;
+    }
+    game.cars.push(c);
+  });
+}
+
+function hideDialogueSoon(game) {
+  if (game.missions.dialogue) game.missions.dialogue.t = 8.9;
+}
+
+// Drive straight ahead for the shot: hold W, steer gently toward the road.
+export function shotPilot(game) {
+  if (game.shotName !== 'cover' && game.shotName !== 'highway') return;
+  const input = game.input;
+  const p = game.player;
+  input.press('up', true);
+  const ahead = p.inCar ? p.inCar : p;
+  const laneY = game.shotLaneY || 1950;
+  const dy = laneY - ahead.y;
+  let targetAngle = ahead.angle;
+  if (Math.abs(dy) > 40) targetAngle = dy > 0 ? Math.PI / 2 : -Math.PI / 2;
+  let diff = targetAngle - ahead.angle;
+  while (diff > Math.PI) diff -= Math.PI * 2;
+  while (diff < -Math.PI) diff += Math.PI * 2;
+  input.press('left', diff < -0.08);
+  input.press('right', diff > 0.08);
+}
+
+export function stageShot(game, name) {
+  game.shotName = name;
+  if (name === 'cover') {
+    // Police chase down a town street: wanted 3, three cruisers, mission live,
+    // buildings on both sides so the town reads at a glance.
+    game.player.money = 1250;
+    game.shotLaneY = 1300;
+    placePlayerCar(game, 1050, 1300, 0);
+    chaseSetup(game, 3, 3);
+    lineUpTraffic(game, 1300, 1300, 2400, 5, true);
+    startMission(game.missionCtx, 0);
+    hideDialogueSoon(game);
+    game.storm = 0.6;
+    game.camera.x = game.player.x - 640;
+    game.camera.y = game.player.y - 360;
+  } else if (name === 'highway') {
+    // Open desert highway at speed, racing the Highway King checkpoints.
+    // Cole starts past checkpoint 1, chasing checkpoint 2 with traffic ahead.
+    game.player.money = 640;
+    game.shotLaneY = 1950;
+    placePlayerCar(game, 1400, 1950, 0);
+    game.player.inCar.speed = 260; // cruising, so the traffic ahead stays in frame
+    lineUpTraffic(game, 1950, 1900, 2400, 5, true);
+    startMission(game.missionCtx, 5);
+    game.missions.step = 1; // checkpoint 2, east end, ahead of the player
+    hideDialogueSoon(game);
+    game.storm = 0.4;
+    game.camera.x = game.player.x - 640;
+    game.camera.y = game.player.y - 360;
+  } else if (name === 'mission') {
+    // Turf war at the diner: Vipers attacking, Cole armed, wanted 1.
+    game.player.money = 980;
+    game.player.hasGun = true;
+    game.player.ammo = 24;
+    game.player.x = 1250;
+    game.player.y = 900;
+    game.player.angle = -Math.PI / 2;
+    addHeat(game.player, 1);
+    startMission(game.missionCtx, 4);
+    hideDialogueSoon(game);
+    game.camera.x = game.player.x - 640;
+    game.camera.y = game.player.y - 360;
+  } else {
+    // town: on foot by the diner, morning in Dustline, first job waiting.
+    // Standing near the diner auto-starts mission 1 on the first frame.
+    game.player.money = 120;
+    game.player.x = 1250;
+    game.player.y = 860;
+    game.player.angle = -Math.PI / 2;
+    game.camera.x = game.player.x - 640;
+    game.camera.y = game.player.y - 360;
   }
-  const over = world.state.lives === 0;
-  return { screen: over ? SCREEN_OVER : SCREEN_PLAY, best: world.state.score };
+  game.screen = 'play';
 }
